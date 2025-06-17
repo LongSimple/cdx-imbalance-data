@@ -1,0 +1,21 @@
+[project]
+name = "cdx-imbalance-data"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.13"
+dependencies = [
+    "pandas>=2.2.3",
+    "requests>=2.32.3",
+    "xbbg>=0.7.7",
+    "cloudscraper @ git+https://github.com/zinzied/cloudscraper.git@master",
+    "blpapi",
+]
+
+# UV Configuration for custom package sources
+[[tool.uv.index]]
+name = "bloomberg"
+url = "https://blpapi.bloomberg.com/repository/releases/python/simple/"
+
+[tool.uv.sources]
+blpapi = { index = "bloomberg" }
