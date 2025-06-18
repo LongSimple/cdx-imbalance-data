@@ -20,7 +20,7 @@ CS_BROWSER_VERSION = "139" # Should be a recent Chrome major version
 CS_REFERER_URL = "https://pddata.dtcc.com/ppd/cftcdashboard"
 
 # --- File Saving Settings ---
-SAVE_DOWNLOADED_FILES = True # Whether to save ZIP and extracted CSV
+SAVE_DOWNLOADED_FILES = False # Whether to save ZIP and extracted CSV
 DOWNLOAD_DIR = "data/dtcc_data" # Base directory for downloads
 SLICES_DOWNLOAD_SUBDIR = "ppd_api_slices"
 EOD_DOWNLOAD_SUBDIR = "s3_eod_cumulative"

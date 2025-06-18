@@ -109,13 +109,7 @@ def normalize_dtcc_quote(row: pd.Series) -> tuple[str | None, float | None, str 
         try:
             val = float(spread_val_str)
             original_notation = spread_notation
-            if "BPS" in spread_notation: # Assuming "BPS", "BASIS_POINTS" etc.
-                quote_value = val # Already in BPS
-            elif "DECIMAL" in spread_notation: # e.g., 0.01 for 100 bps
-                quote_value = val * 10000 # Convert decimal to BPS
-            else: # Unknown notation, assume BPS but log warning
-                logger.debug(f"Unknown spread notation '{spread_notation}' for value {val}. Assuming BPS.")
-                quote_value = val
+            quote_value = val
             quote_basis = "spread"
         except ValueError:
             logger.warning(f"Could not convert spread_value '{spread_val_str}' to float.")

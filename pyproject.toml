@@ -10,6 +10,9 @@ dependencies = [
     "xbbg>=0.7.7",
     "cloudscraper @ git+https://github.com/zinzied/cloudscraper.git@master",
     "blpapi",
+    "ipykernel>=6.29.5",
+    "polars>=1.30.0",
+    "matplotlib>=3.10.3",
 ]
 
 # UV Configuration for custom package sources

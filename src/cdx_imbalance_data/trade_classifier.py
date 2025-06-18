@@ -1,6 +1,6 @@
 import logging
 import pandas as pd
-import datetime
+import datetime as dt
 
 from . import config
 from . import economic_conversions as econ_conv
@@ -12,136 +12,128 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 
+def _create_mid_price_series(bloomberg_ticks_df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Creates a continuous mid-price series from raw Bloomberg bid/ask ticks.
+    """
+    ticks = bloomberg_ticks_df.copy()
+    # Timestamps from bloomberg_connector are already timezone-aware ('America/New_York')
+    # Convert to UTC for comparison with DTCC data
+    ticks['timestamp_utc'] = pd.to_datetime(ticks['timestamp']).dt.tz_convert('UTC')
+    ticks = ticks.sort_values(by="timestamp_utc").set_index("timestamp_utc")
+    
+    # Separate bids and asks
+    bids = ticks[ticks['typ'] == 'BID'][['value']].rename(columns={'value': 'bid_price'})
+    asks = ticks[ticks['typ'] == 'ASK'][['value']].rename(columns={'value': 'ask_price'})
+
+    # Combine and forward-fill
+    market_state = pd.concat([bids, asks], axis=1).ffill()
+    
+    # Calculate mid-price
+    market_state['mid_price'] = (market_state['bid_price'] + market_state['ask_price']) / 2.0
+    
+    # Drop rows where mid-price is still NaN (i.e., before the first bid/ask pair)
+    market_state.dropna(subset=['mid_price'], inplace=True)
+    
+    logger.info(f"Created mid-price series with {len(market_state)} entries.")
+    logger.info("Mid-price time series:")
+    print(market_state.head())
+    return market_state
+
+
 def classify_trades(
-    dtcc_trades_df: pd.DataFrame, bloomberg_mids_df: pd.DataFrame
+    dtcc_trades_df: pd.DataFrame, bloomberg_ticks_df: pd.DataFrame, notation_type: str
 ) -> pd.DataFrame:
     """
-    Classifies DTCC trades as 'bid_side', 'offer_side', 'mid_market', or 'unclassifiable'
-    by comparing them to interpolated Bloomberg mid-prices/spreads.
-
-    Args:
-        dtcc_trades_df: DataFrame of preprocessed DTCC trades.
-                        Expected columns include 'execution_timestamp_utc', 'product_name',
-                        'price_value', 'price_notation', 'spread_value', 'spread_notation'.
-        bloomberg_mids_df: DataFrame of Bloomberg mid-prices.
-                           Expected columns: 'timestamp_utc', 'mid_price' (which is a spread).
-
-    Returns:
-        The DTCC trades DataFrame with an added 'trade_classification' column.
+    Classifies DTCC trades by comparing them to the calculated Bloomberg mid-price.
     """
     if dtcc_trades_df.empty:
         logger.warning("DTCC trades DataFrame is empty. No trades to classify.")
-        return dtcc_trades_df.copy() # Return a copy to avoid modifying original if it was empty
-    
-    if bloomberg_mids_df.empty:
-        logger.warning(
-            "Bloomberg mids DataFrame is empty. All trades will be 'unclassifiable_no_mid'."
-        )
+        return dtcc_trades_df.copy()
+
+    # Filter for the target UPI and remove package trades
+    if 'unique_product_identifier' in dtcc_trades_df.columns and config.TARGET_UPI:
+        dtcc_trades_df = dtcc_trades_df[dtcc_trades_df['unique_product_identifier'] == config.TARGET_UPI].copy()
+        logger.info(f"Filtered for TARGET_UPI '{config.TARGET_UPI}'. {len(dtcc_trades_df)} trades remaining.")
+    if 'package_indicator' in dtcc_trades_df.columns:
+        dtcc_trades_df = dtcc_trades_df[dtcc_trades_df['package_indicator'] != 'Y'].copy()
+        logger.info(f"Filtered out package trades. {len(dtcc_trades_df)} trades remaining.")
+
+    if dtcc_trades_df.empty:
+        logger.warning("No trades remaining after filtering.")
+        return dtcc_trades_df
+
+    if bloomberg_ticks_df.empty:
+        logger.warning("Bloomberg ticks DataFrame is empty. All trades will be 'unclassifiable_no_mid'.")
         dtcc_trades_df["trade_classification"] = "unclassifiable_no_mid"
         return dtcc_trades_df
 
-    # Ensure Bloomberg data is sorted by time for interpolation
-    bloomberg_mids_df = bloomberg_mids_df.sort_values(
-        by="timestamp_utc"
-    ).set_index("timestamp_utc")
+    # Create the continuous mid-price series
+    bberg_mid_series = _create_mid_price_series(bloomberg_ticks_df)
+
+    if bberg_mid_series.empty:
+        logger.warning("Could not create mid-price series from Bloomberg data. All trades will be 'unclassifiable_no_mid'.")
+        dtcc_trades_df["trade_classification"] = "unclassifiable_no_mid"
+        return dtcc_trades_df
 
     classifications = []
-
     for _, trade_row in dtcc_trades_df.iterrows():
         trade_ts = trade_row["execution_timestamp_utc"]
-        classification = "unclassifiable_error" # Default
+        classification = "unclassifiable_error"
 
-        # 1. Normalize DTCC quote (determine basis and value)
+        # 1. Normalize DTCC quote
         dtcc_quote_basis, dtcc_quote_value, _ = econ_conv.normalize_dtcc_quote(trade_row)
-
         if dtcc_quote_basis is None or pd.isna(dtcc_quote_value):
             classification = "unclassifiable_bad_dtcc_quote"
             classifications.append(classification)
             continue
 
-        # 2. Find relevant Bloomberg mid
-        # Define the window for interpolation based on latency filter
-        time_window_start = trade_ts - datetime.timedelta(
-            seconds=config.LATENCY_FILTER_SECONDS
-        )
-        time_window_end = trade_ts + datetime.timedelta(
-            seconds=config.LATENCY_FILTER_SECONDS
-        )
-
-        # Get Bloomberg mids within the latency window around the trade
-        relevant_bberg_mids = bloomberg_mids_df[
-            (bloomberg_mids_df.index >= time_window_start) &
-            (bloomberg_mids_df.index <= time_window_end)
-        ]
-
-        if relevant_bberg_mids.empty:
-            classification = "unclassifiable_stale_mid" # No mid within latency window
-            classifications.append(classification)
-            continue
-        
-        # Interpolate: find the closest mid if multiple, or use as-of merge
-        # For simplicity, using pandas merge_asof to get the latest mid before or at trade_ts
-        # We need to ensure bloomberg_mids_df is suitable for merge_asof (sorted index)
-        # And dtcc_trades_df needs a temporary column for merge_asof if its index isn't timestamp
-        
-        # Alternative: find closest mid_price in `relevant_bberg_mids`
-        # Calculate time difference to all relevant mids
-        relevant_bberg_mids["time_diff"] = abs(relevant_bberg_mids.index - trade_ts)
-        closest_mid_row = relevant_bberg_mids.loc[relevant_bberg_mids["time_diff"].idxmin()]
-        
-        bberg_mid_spread = closest_mid_row["mid_price"] # This is a spread from PX_MID
-
-        if pd.isna(bberg_mid_spread):
-            classification = "unclassifiable_nan_bberg_mid"
-            classifications.append(classification)
-            continue
-
-        # 3. Economic Comparison
+        # 2. Find relevant Bloomberg mid-price
         try:
-            if dtcc_quote_basis == "spread":
-                # Both are spreads (DTCC spread vs Bloomberg mid-spread)
-                # Ensure units are consistent (assume BPS for both for now)
-                dtcc_s = float(dtcc_quote_value)
-                bberg_s = float(bberg_mid_spread)
+            closest_market_state = bberg_mid_series.asof(trade_ts)
+            if pd.isna(closest_market_state['mid_price']):
+                classification = "unclassifiable_stale_mid"
+                classifications.append(classification)
+                continue
+            
+            time_to_mid = abs(trade_ts - closest_market_state.name)
+            if time_to_mid > dt.timedelta(seconds=config.LATENCY_FILTER_SECONDS):
+                classification = "unclassifiable_stale_mid"
+                classifications.append(classification)
+                continue
+            
+            bberg_mid_spread = closest_market_state["mid_price"]
 
-                if dtcc_s < bberg_s:
-                    classification = "bid_side"
-                elif dtcc_s > bberg_s:
-                    classification = "offer_side"
+            # 3. Economic Comparison
+            trade_spread_bps = None
+            if notation_type == "spread":
+                trade_spread_bps = float(dtcc_quote_value) * 10000
+            elif notation_type == "price":
+                trade_spread_bps = econ_conv.convert_price_to_spread(price=float(dtcc_quote_value))
+
+            if trade_spread_bps is None or pd.isna(trade_spread_bps):
+                classification = "unclassifiable_conversion_failed"
+            else:
+                if trade_spread_bps < 0:
+                    logger.warning(f"Filtering out trade with negative spread: {trade_spread_bps} bps")
+                    classification = "unclassifiable_negative_spread"
+                elif trade_spread_bps > bberg_mid_spread:
+                    classification = "buy"
+                elif trade_spread_bps < bberg_mid_spread:
+                    classification = "sell"
                 else:
                     classification = "mid_market"
-
-            elif dtcc_quote_basis == "price":
-                # DTCC is price, Bloomberg mid is spread. Convert Bloomberg mid-spread to price.
-                # This requires the economic_conversions.convert_spread_to_price
-                # and parameters like tenor, coupon, recovery.
-                # For now, using placeholder.
-                # TODO: Get actual tenor for the specific product if possible, default to 5Y
-                bberg_mid_price_converted = econ_conv.convert_spread_to_price(
-                    spread_bps=float(bberg_mid_spread)
-                    # Add other params like years_to_maturity if available from product_name
-                )
-
-                if pd.isna(bberg_mid_price_converted):
-                    classification = "unclassifiable_conversion_failed"
-                else:
-                    dtcc_p = float(dtcc_quote_value)
-                    if dtcc_p < bberg_mid_price_converted:
-                        classification = "bid_side" # Assuming lower price means bid for upfront points
-                    elif dtcc_p > bberg_mid_price_converted:
-                        classification = "offer_side" # Assuming higher price means offer
-                    else:
-                        classification = "mid_market"
-            else:
-                classification = "unclassifiable_unknown_basis"
         
-        except ValueError:
-            logger.error(f"ValueError during comparison for trade {trade_row.get('dissemination_id')}")
+        except (ValueError, TypeError) as e:
+            logger.error(f"Error during comparison for trade {trade_row.get('dissemination_id')}: {e}")
             classification = "unclassifiable_comparison_error"
-        except Exception as e:
-            logger.error(f"Unexpected error during comparison for trade {trade_row.get('dissemination_id')}: {e}")
-            classification = "unclassifiable_comparison_error"
-            
+        
+        logger.info(
+            f"Trade {trade_row.get('dissemination_id')}: "
+            f"DTCC Quote ({notation_type}) = {trade_spread_bps} @ {trade_ts}, "
+            f"Bloomberg Mid = {bberg_mid_spread} @ {closest_market_state.name}, "
+            f"Classification = {classification}"
+        )
         classifications.append(classification)
 
     dtcc_trades_df["trade_classification"] = classifications
@@ -183,7 +175,7 @@ if __name__ == "__main__":
     bberg_df = pd.DataFrame(dummy_bberg_data)
 
     logger.info("Classifying dummy trades...")
-    classified_df = classify_trades(dtcc_df.copy(), bberg_df.copy()) # Use copies
+    classified_df = classify_trades(dtcc_df.copy(), bberg_df.copy(), "spread") # Use copies
     
     if classified_df is not None:
         logger.info("Classification Results:")
@@ -193,12 +185,12 @@ if __name__ == "__main__":
 
     # Example with empty bloomberg data
     logger.info("\nClassifying with empty Bloomberg data...")
-    classified_empty_bberg_df = classify_trades(dtcc_df.copy(), pd.DataFrame(columns=bberg_df.columns))
+    classified_empty_bberg_df = classify_trades(dtcc_df.copy(), pd.DataFrame(columns=bberg_df.columns), "spread")
     if classified_empty_bberg_df is not None:
         print(classified_empty_bberg_df[["dissemination_id", "trade_classification"]])
 
     # Example with empty dtcc data
     logger.info("\nClassifying with empty DTCC data...")
-    classified_empty_dtcc_df = classify_trades(pd.DataFrame(columns=dtcc_df.columns), bberg_df.copy())
+    classified_empty_dtcc_df = classify_trades(pd.DataFrame(columns=dtcc_df.columns), bberg_df.copy(), "spread")
     if classified_empty_dtcc_df is not None:
         print(classified_empty_dtcc_df)
